@@ -1,26 +1,39 @@
 #!/usr/bin/env python3
 """
-Surface Laptop 2 webcam bridge — PipeWire-native, idle-aware
-ov9734 IPU3 RAW10 (ip3G) → debayer → PipeWire Video/Source node
+Surface Laptop 2 webcam bridge — PipeWire + V4L2 loopback, idle-aware
+ov9734 IPU3 RAW10 (ip3G) → debayer → pipewiresink (node 77, for Cheese)
+                                    → /dev/video20 YUYV (for Firefox V4L2
+                                      direct access and portal via node 83)
 
-Creates a PipeWire Video/Source node so apps (Cheese, browsers via portal, etc.)
-can find the camera. Sensor capture only starts when a real PipeWire consumer
-links to our node (detected via pw-dump, not need-data which fires spuriously).
+Consumer detection:
+  - PipeWire links to node 77 (ov9734-webcam) or node 83 (v4l2loopback)
+  - Direct V4L2 readers on /dev/video20 (Firefox bypasses the portal)
+
+/dev/video20 is opened at startup with YUYV format so node 83's format is
+stable before any app tries to connect (fixes portal buffer-alloc failures).
 """
-import subprocess, signal, sys, os, time, threading, fcntl, select, json
+import subprocess, signal, sys, os, time, threading, fcntl, select, json, struct
 import numpy as np
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
 
-SENSOR_W  = 1296
-SENSOR_H  = 734
-STRIDE    = 1664
-FRAME_IN  = STRIDE * SENSOR_H
-OUT_W     = SENSOR_W // 2
-OUT_H     = SENSOR_H // 2
-FRAMERATE = 30
+SENSOR_W   = 1296
+SENSOR_H   = 734
+STRIDE     = 1664
+FRAME_IN   = STRIDE * SENSOR_H
+OUT_W      = SENSOR_W // 2
+OUT_H      = SENSOR_H // 2
+FRAMERATE  = 30
 STOP_GRACE = 5.0
+V4L2_DEV   = '/dev/video20'
+
+# V4L2 constants
+_VIDIOC_S_FMT              = 0xc0d05605
+_VIDIOC_STREAMON           = 0x40045612   # _IOW('V', 18, int)
+_V4L2_BUF_TYPE_OUTPUT      = 2            # writer always uses OUTPUT type regardless of exclusive_caps
+_V4L2_PIX_FMT_YUYV         = 0x56595559  # 'YUYV' little-endian
+_YUYV_STRIDE               = OUT_W * 2   # 2 bytes per pixel
 
 
 def find_cio2_video_node():
@@ -54,6 +67,46 @@ def setup_media_pipeline():
       subprocess.run(cmd, check=True, capture_output=True)
 
 
+def open_v4l2_loopback():
+  """Open /dev/video20 as writer and fix YUYV format via ioctl.
+  Returns the fd, or None if unavailable (no v4l2loopback module)."""
+  try:
+      fd = os.open(V4L2_DEV, os.O_WRONLY | os.O_NONBLOCK)
+  except OSError as e:
+      print(f'v4l2loopback not available ({e}), skipping', flush=True)
+      return None
+  # struct v4l2_format layout (208 bytes total):
+  #   offset 0: type (4 bytes)
+  #   offset 4: 4 bytes padding (fmt union is 8-byte aligned because
+  #             v4l2_window inside the union contains 64-bit pointers)
+  #   offset 8: fmt union (200 bytes) — fmt.pix starts here:
+  #     +0  width, +4  height, +8  pixelformat, +12 field,
+  #     +16 bytesperline, +20 sizeimage, +24 colorspace
+  # struct v4l2_format (208 bytes): type@0, padding@4, fmt.pix@8
+  # Set both OUTPUT and CAPTURE format to YUYV 648×367 before WirePlumber
+  # or Firefox open the device. Without locking CAPTURE here, WirePlumber
+  # negotiates MJPG 960×720 independently, causing a format mismatch.
+  def _sfmt(buf_type):
+      fmt = bytearray(208)
+      struct.pack_into('<I', fmt,  0, buf_type)
+      struct.pack_into('<I', fmt,  8, OUT_W)
+      struct.pack_into('<I', fmt, 12, OUT_H)
+      struct.pack_into('<I', fmt, 16, _V4L2_PIX_FMT_YUYV)
+      struct.pack_into('<I', fmt, 20, 1)                       # V4L2_FIELD_NONE
+      struct.pack_into('<I', fmt, 24, _YUYV_STRIDE)
+      struct.pack_into('<I', fmt, 28, _YUYV_STRIDE * OUT_H)
+      return fmt
+  fmt = _sfmt(_V4L2_BUF_TYPE_OUTPUT)
+  try:
+      fcntl.ioctl(fd, _VIDIOC_S_FMT, fmt)
+  except OSError as e:
+      print(f'v4l2loopback VIDIOC_S_FMT failed ({e}), skipping', flush=True)
+      os.close(fd)
+      return None
+  print(f'v4l2loopback: {V4L2_DEV} ready ({OUT_W}×{OUT_H} YUYV)', flush=True)
+  return fd
+
+
 def unpack_ipu3_raw10(buf):
   raw = np.frombuffer(buf, dtype=np.uint8).reshape(SENSOR_H, 52, 32)
   u32 = raw.view('<u4')
@@ -82,8 +135,24 @@ def debayer_grbg_half(raw):
   return np.stack([r, g, b], axis=2)
 
 
-def capture_loop(appsrc, sensor_dev, stop_event):
-  """Read sensor frames and push to appsrc until stop_event is set."""
+def rgb_to_yuyv(rgb):
+  """Convert H×W×3 uint8 RGB to H×2W uint8 YUYV (for v4l2loopback)."""
+  r = rgb[:, :, 0].astype(np.float32)
+  g = rgb[:, :, 1].astype(np.float32)
+  b = rgb[:, :, 2].astype(np.float32)
+  y = np.clip( 0.299*r + 0.587*g + 0.114*b,       0, 255).astype(np.uint8)
+  u = np.clip(-0.147*r - 0.289*g + 0.436*b + 128, 0, 255).astype(np.uint8)
+  v = np.clip( 0.615*r - 0.515*g - 0.100*b + 128, 0, 255).astype(np.uint8)
+  yuyv = np.empty((rgb.shape[0], rgb.shape[1] * 2), dtype=np.uint8)
+  yuyv[:, 0::4] = y[:, 0::2]   # Y0
+  yuyv[:, 1::4] = u[:, 0::2]   # U
+  yuyv[:, 2::4] = y[:, 1::2]   # Y1
+  yuyv[:, 3::4] = v[:, 0::2]   # V
+  return yuyv
+
+
+def capture_loop(appsrc, sensor_dev, stop_event, v4l2_fd):
+  """Read sensor frames, push to pipewiresink and optionally /dev/video20."""
   v4l2 = subprocess.Popen([
       'v4l2-ctl', '-d', sensor_dev,
       '--set-fmt-video=width=1296,height=734,pixelformat=ip3G',
@@ -115,8 +184,16 @@ def capture_loop(appsrc, sensor_dev, stop_event):
               frame_count += 1
               if frame_count % 30 == 0:
                   print(f'  {frame_count} frames', flush=True)
+              # Push to pipewiresink (Cheese / PipeWire-native apps)
               gst_buf = Gst.Buffer.new_wrapped(rgb.tobytes())
               appsrc.emit('push-buffer', gst_buf)
+              # Write YUYV to v4l2loopback (Firefox V4L2 direct / portal node 83)
+              if v4l2_fd is not None:
+                  try:
+                      os.write(v4l2_fd, rgb_to_yuyv(rgb).tobytes())
+                  except OSError as e:
+                      if frame_count <= 3 or frame_count % 300 == 0:
+                          print(f'v4l2 write error: {e}', file=sys.stderr, flush=True)
   finally:
       v4l2.terminate()
       v4l2.wait()
@@ -138,6 +215,11 @@ def main():
       print(f'media-ctl setup failed: {e}', file=sys.stderr)
       sys.exit(1)
 
+  # Open and hold v4l2loopback at startup to lock YUYV 648×367 format
+  # BEFORE any consumer (Firefox, WirePlumber) opens the device.
+  # Without this, Firefox negotiates MJPG at a different size and gets no frames.
+  v4l2_fd = open_v4l2_loopback()
+
   caps_str = (f'video/x-raw,format=RGB,'
               f'width={OUT_W},height={OUT_H},'
               f'framerate={FRAMERATE}/1')
@@ -146,10 +228,9 @@ def main():
       f'videoconvert ! '
       f'pipewiresink name=pw-sink sync=false'
   )
-  appsrc   = pipeline.get_by_name('src')
-  pw_sink  = pipeline.get_by_name('pw-sink')
+  appsrc  = pipeline.get_by_name('src')
+  pw_sink = pipeline.get_by_name('pw-sink')
 
-  # Configure as a Video/Source node so WirePlumber lists it under Sources
   stream_props = Gst.Structure.new_from_string(
       'props,'
       'media.class=(string)Video/Source,'
@@ -158,9 +239,9 @@ def main():
   )
   pw_sink.set_property('stream-properties', stream_props)
 
-  lock           = threading.Lock()
-  capture_thread = [None]
-  stop_event     = [None]
+  lock               = threading.Lock()
+  capture_thread     = [None]
+  stop_event         = [None]
   last_had_consumers = [0.0]
 
   def start_capture():
@@ -171,7 +252,7 @@ def main():
           stop_event[0] = threading.Event()
           t = threading.Thread(
               target=capture_loop,
-              args=(appsrc, sensor_dev, stop_event[0]),
+              args=(appsrc, sensor_dev, stop_event[0], v4l2_fd),
               daemon=True,
           )
           capture_thread[0] = t
@@ -205,27 +286,45 @@ def main():
       if t:
           t.join(timeout=3)
       pipeline.set_state(Gst.State.NULL)
+      if v4l2_fd is not None:
+          os.close(v4l2_fd)
       glib_loop.quit()
 
   signal.signal(signal.SIGTERM, cleanup)
   signal.signal(signal.SIGINT,  cleanup)
 
-  def get_consumer_count(node_id):
-      """Return number of active PipeWire links where we are the source."""
+  def get_consumer_count(pw_node_ids):
+      """PipeWire link count on our nodes + direct V4L2 readers on /dev/video20."""
+      pw_count = 0
       try:
-          data = json.loads(subprocess.check_output(
+          data  = json.loads(subprocess.check_output(
               ['pw-dump'], text=True, stderr=subprocess.DEVNULL, timeout=3,
           ))
           links = [o for o in data if o.get('type') == 'PipeWire:Interface:Link']
-          return sum(
+          pw_count = sum(
               1 for l in links
-              if l.get('info', {}).get('output-node-id') == node_id
+              if l.get('info', {}).get('output-node-id') in pw_node_ids
           )
       except Exception:
-          return 0
+          pass
+      # Also detect Firefox and other apps that open /dev/video20 directly
+      v4l2_count = 0
+      if v4l2_fd is not None:
+          try:
+              out = subprocess.check_output(
+                  ['fuser', V4L2_DEV], stderr=subprocess.DEVNULL,
+                  text=True, timeout=2,
+              )
+              pids = {int(p) for p in out.split() if p.strip().isdigit()}
+              pids.discard(os.getpid())
+              v4l2_count = len(pids)
+          except Exception:
+              pass
+      return pw_count + v4l2_count
 
-  def find_our_node_id():
-      """Poll pw-dump until our PipeWire node appears (may take a moment)."""
+  def find_node_ids():
+      """Return (pw_id, v4l2_node_id): our pipewiresink and the v4l2loopback node."""
+      pw_id = v4l2_node_id = None
       deadline = time.time() + 15
       while time.time() < deadline:
           try:
@@ -236,23 +335,29 @@ def main():
                   if obj.get('type') == 'PipeWire:Interface:Node':
                       props = obj.get('info', {}).get('props', {})
                       if props.get('node.name') == 'ov9734-webcam':
-                          return obj['id']
+                          pw_id = obj['id']
+                      if (props.get('device.api') == 'v4l2'
+                              and 'video20' in props.get('node.name', '')):
+                          v4l2_node_id = obj['id']
           except Exception:
               pass
+          if pw_id is not None:
+              break
           time.sleep(0.5)
-      return None
+      return pw_id, v4l2_node_id
 
   def pw_watcher():
-      """Detect real PipeWire consumers via pw-dump links; start/stop capture."""
-      node_id = find_our_node_id()
-      if node_id is None:
-          print('Warning: PW node not found — consumer detection disabled', file=sys.stderr, flush=True)
+      pw_id, v4l2_node_id = find_node_ids()
+      if pw_id is None:
+          print('Warning: PW node not found — consumer detection disabled',
+                file=sys.stderr, flush=True)
           return
-      print(f'PW node ID: {node_id}', flush=True)
+      node_ids = {n for n in (pw_id, v4l2_node_id) if n is not None}
+      print(f'Watching: pipewiresink={pw_id} v4l2loopback={v4l2_node_id}', flush=True)
 
       while glib_loop.is_running():
-          time.sleep(1)
-          n = get_consumer_count(node_id)
+          time.sleep(0.25)
+          n   = get_consumer_count(node_ids)
           now = time.time()
           with lock:
               running = capture_thread[0] and capture_thread[0].is_alive()

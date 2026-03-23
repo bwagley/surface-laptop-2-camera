@@ -98,6 +98,16 @@ install -d "$INSTALL_DIR"
 install -m 755 "$SCRIPT_DIR/bridge/camera-bridge.py" "$INSTALL_DIR/"
 info "  $INSTALL_DIR/camera-bridge.py installed"
 
+# ── WirePlumber config ────────────────────────────────────────────────────────
+# Prevents WirePlumber from negotiating MJPG on /dev/video20, which would
+# conflict with the bridge's YUYV output format.
+info "Installing WirePlumber config for $REAL_USER..."
+WP_CONF_DIR="$REAL_HOME/.config/wireplumber/wireplumber.conf.d"
+mkdir -p "$WP_CONF_DIR"
+install -m 644 "$SCRIPT_DIR/wireplumber/51-disable-v4l2loopback.conf" "$WP_CONF_DIR/"
+chown -R "$REAL_USER:$REAL_USER" "$REAL_HOME/.config/wireplumber"
+info "  WirePlumber config installed"
+
 # ── User systemd service ──────────────────────────────────────────────────────
 info "Installing user systemd service for $REAL_USER..."
 SERVICE_DIR="$REAL_HOME/.config/systemd/user"

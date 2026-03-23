@@ -16,6 +16,11 @@ rm -f "$HOME/.config/systemd/user/camera-bridge.service"
 systemctl --user daemon-reload 2>/dev/null || true
 info "  Done"
 
+# ── WirePlumber config ────────────────────────────────────────────────────────
+info "Removing WirePlumber config..."
+rm -f "$HOME/.config/wireplumber/wireplumber.conf.d/51-disable-v4l2loopback.conf"
+info "  Done"
+
 # ── System components (require sudo) ──────────────────────────────────────────
 info "Removing system components (sudo required)..."
 
