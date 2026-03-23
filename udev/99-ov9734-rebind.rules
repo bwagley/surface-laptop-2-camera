@@ -1,0 +1,6 @@
+# Rebind INT3472:00 and ov9734 after ipu3_cio2 loads.
+# ipu_bridge sets up fwnode software nodes during ipu3_cio2 probe, but both
+# INT3472:00 and ov9734 have already probed and failed by then.
+# PCI device 8086:9d32 = Intel IPU3 CIO2
+ACTION=="bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x8086", ATTR{device}=="0x9d32", \
+    RUN+="/bin/sh /usr/local/sbin/ipu3-camera-rebind.sh"
