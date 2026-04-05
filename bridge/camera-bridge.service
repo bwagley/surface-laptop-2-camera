@@ -1,13 +1,13 @@
 [Unit]
-Description=Surface Laptop 2 OV9734 webcam bridge
-After=wireplumber.service
-Wants=wireplumber.service
+Description=Surface Laptop 2 Camera Bridge (ov9734 → PipeWire + V4L2)
+After=pipewire.service
+Requires=pipewire.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/share/surface-laptop-2-camera/camera-bridge.py
+ExecStart=%h/.local/bin/camera-bridge
 Restart=on-failure
-RestartSec=5
+RestartSec=3
 
 [Install]
 WantedBy=default.target

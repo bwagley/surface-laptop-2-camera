@@ -1,13 +1,19 @@
-# Surface Laptop 2 — OV9734 Webcam Fix
+# Surface Laptop 2 — Camera Bridge
 
-Gets the built-in webcam working on **Surface Laptop 2 (Model 1769)** running
+Userspace camera bridge for the **Surface Laptop 2 (Model 1769)** running
 the [linux-surface](https://github.com/linux-surface/linux-surface) kernel on
-Ubuntu/Debian-based distributions (tested on POP!_OS 24.04).
+Fedora Silverblue, with [tomgood18](https://github.com/tomgood18/surface-laptop-2-camera) drivers installed.
 
-The camera will appear as **"Surface Laptop 2 Webcam"** in PipeWire and works
-with Cheese, browsers (via xdg-desktop-portal), OBS, and any other PipeWire
-Video/Source consumer. The camera light only turns on when an application
-actively requests the camera, and turns off automatically when it disconnects.
+Reads raw IPU3 Bayer frames from the OV9734 sensor, debayers them to RGB, and
+publishes a **PipeWire Video/Source** node plus a V4L2 loopback device. The
+camera appears as **"Surface Laptop 2 Webcam"** in any application.
+
+To avoid high idle CPU usage, A **GNOME Shell extension** provides a top-bar toggle to start/stop the bridge
+and adjust camera brightness via D-Bus — no always-on service required.
+
+> **Note:** This repo only handles the userspace bridge. Kernel-level fixes
+> (DKMS modules for `ipu_bridge` and `ov9734`, udev rebind rules) are managed
+> separately via the Silverblue image.
 
 ---
 
@@ -16,80 +22,72 @@ actively requests the camera, and turns off automatically when it disconnects.
 | Requirement | Notes |
 |-------------|-------|
 | Hardware | Surface Laptop 2 (Model 1769) |
-| Kernel | [linux-surface](https://github.com/linux-surface/linux-surface) kernel (`*-surface-*`) |
-| Audio session | PipeWire + WirePlumber (default on Ubuntu 22.04+ / POP!_OS) |
-| Build tools | `dkms`, `linux-headers-$(uname -r)` (installed automatically) |
+| Kernel | [linux-surface](https://github.com/linux-surface/linux-surface) kernel |
+| Driver | [tomgood18](https://github.com/tomgood18/surface-laptop-2-camera) IPU3/OV9734 DKMS modules |
+| Desktop | GNOME Shell 49+ on PipeWire |
+| Build tools | `g++`, `pkg-config`, GStreamer 1.0 dev headers, GLib 2.0 dev headers |
 
 ---
 
-## Why this is needed — the three-layer problem
+## How it works
 
-The stock kernel has three separate bugs that each prevent the camera working:
-
-### Layer 1 — ipu_bridge doesn't know about this sensor
-`ipu_bridge` (the Intel IPU3 camera bridge driver) maintains a list of
-supported sensors. The OV9734 used in the Surface Laptop 2 (`OVTI9734` ACPI
-ID) is not in that list, so the bridge never creates the software fwnode that
-connects the sensor to the IPU3 pipeline.
-
-**Fix:** DKMS module `ipu-bridge-ov9734` replaces `ipu_bridge.ko` with a
-version that includes `OVTI9734`.
-
-### Layer 2 — probe ordering race condition
-`ov9734` probes over I²C before `ipu3_cio2` has loaded. At that point
-`ipu_bridge_init()` hasn't run yet, so no fwnode exists and `ov9734_probe()`
-fails with `-ENODEV`.
-
-**Fix:** A udev rule triggers when the IPU3 CIO2 PCI device (`8086:9d32`)
-binds, then immediately rebinds `ov9734` so it probes again after the fwnode
-exists.
-
-> **Note:** Do NOT rebind `INT3472:00` or `INT3472:01`. The `int3472-discrete`
-> driver calls `acpi_dev_clear_dependencies()` which is one-shot — rebinding
-> it after boot will always fail and requires a reboot to recover.
-
-### Layer 3 — sensor never gets its clock or reset signal
-The ACPI firmware for this machine exposes two GPIOs via `INT3472:01`:
-- **GPIO 120** → clock enable (MCLK to the sensor)
-- **GPIO 77** → reset (active-low)
-
-The stock `ov9734` driver never asserts these, so the sensor stays powered
-down and all I²C transactions return `-EREMOTEIO`.
-
-**Fix:** DKMS module `ov9734-surface` replaces `ov9734.ko` with a patched
-version that calls `clk_prepare_enable()` (asserts GPIO 120) and
-`gpiod_set_value(reset, 0)` (deasserts GPIO 77) during probe.
-
-### The bridge — RAW10 → PipeWire
 The IPU3 CIO2 captures raw `SGRBG10_1X10` (Bayer 10-bit) frames. No in-kernel
-debayer path exists for this format, so a userspace bridge script
-(`camera-bridge.py`) reads raw frames, debayers them to RGB, and publishes
-them as a **PipeWire Video/Source** node.
+debayer path exists for this format, so the bridge:
 
-The bridge uses `pw-dump` to watch for real PipeWire consumer links. The
-sensor only starts capturing when an application actually connects; it stops
-~5 seconds after the last application disconnects.
+1. Configures the media pipeline (`media-ctl`) and sensor controls
+2. Reads raw frames via `v4l2-ctl --stream-mmap`
+3. Unpacks IPU3 RAW10 → 8-bit Bayer
+4. Debayers with 2x2 binning → 648x367 RGB
+5. Pushes frames to a **PipeWire Video/Source** node via GStreamer `pipewiresink`
+6. Simultaneously writes YUYV to `/dev/video20` (V4L2 loopback) for apps that use V4L2 directly
+
+The bridge watches for consumer connections (PipeWire links or direct V4L2
+readers) and only starts the sensor when an application requests the camera.
+It stops automatically ~5 seconds after the last consumer disconnects.
+
+### Brightness control
+
+The bridge exposes a D-Bus interface (`com.surface.CameraBridge`) for
+adjusting brightness at runtime. The GNOME extension uses this to provide
+up/down controls in the panel menu.
 
 ---
 
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/surface-laptop-2-camera.git
+git clone https://github.com/bwagley/surface-laptop-2-camera.git
 cd surface-laptop-2-camera
-sudo ./install.sh
+./install.sh
 ```
 
-Then **reboot**.
+No `sudo` required — everything installs under `~/.local` and `~/.config`:
 
-After rebooting:
+| Component | Path |
+|-----------|------|
+| Bridge binary | `~/.local/bin/camera-bridge` |
+| Systemd user service | `~/.config/systemd/user/camera-bridge.service` |
+| GNOME extension | `~/.local/share/gnome-shell/extensions/camera-bridge@surface/` |
+
+After installing, log out and back in (or restart GNOME Shell) to load the
+extension.
+
+---
+
+## Usage
+
+1. A **camera icon** appears in the GNOME top bar
+2. Click it to open the menu:
+   - **Toggle switch** — start/stop the camera bridge service
+   - **Brightness controls** — adjust camera brightness (0%–300%)
+   - **Status** — shows whether the bridge is running
+3. When the bridge is running, the camera appears in Cheese, Firefox, OBS, etc.
+
+To start/stop manually without the extension:
 
 ```bash
-# Check the bridge is running
-systemctl --user status camera-bridge.service
-
-# Test the camera
-cheese
+systemctl --user start camera-bridge.service
+systemctl --user stop camera-bridge.service
 ```
 
 ---
@@ -98,93 +96,87 @@ cheese
 
 ```bash
 cd surface-laptop-2-camera
-./uninstall.sh   # no sudo needed — it will prompt when required
+./uninstall.sh
 ```
-
-Then reboot.
 
 ---
 
 ## Troubleshooting
 
-### Camera not found in apps after reboot
+### Camera not found in apps
 
+Check the bridge service:
 ```bash
 systemctl --user status camera-bridge.service
-```
-
-If the service is not running:
-```bash
-systemctl --user start camera-bridge.service
 journalctl --user -u camera-bridge.service -n 50
 ```
 
 ### "Could not find ipu3-cio2 1 video node"
 
-The udev rebind may not have fired. Check:
+The kernel-level DKMS modules or udev rebind may not be working. This is
+handled outside this repo — check your Silverblue image configuration.
+
 ```bash
 dmesg | grep -E "ov9734|ipu3|OVTI"
-ls /dev/media*
 media-ctl -d /dev/media0 -p | grep -E "ov9734|cio2"
-```
-
-If `ov9734 2-0036` is not in the media graph, trigger a manual rebind:
-```bash
-sudo /usr/local/sbin/ipu3-camera-rebind.sh
-```
-
-### Camera light stays on / sensor never turns off
-
-Check whether another application holds the camera open:
-```bash
-pw-dump | python3 -c "
-import json,sys
-data=json.load(sys.stdin)
-links=[o for o in data if o.get('type')=='PipeWire:Interface:Link']
-print(f'{len(links)} PipeWire links active')
-for l in links: print(' ', l.get('info',{}).get('output-node-id'), '->', l.get('info',{}).get('input-node-id'))
-"
 ```
 
 ### Green / colour-shifted image
 
-The debayer white balance coefficients in `camera-bridge.py` are tuned for
-the Surface Laptop 2. If colours look wrong, adjust the multipliers in the
-`debayer_grbg_half()` function:
-```python
-r = np.clip(r * 2.0, 0, 255)   # increase to warm up
-g = np.clip(g * 1.0, 0, 255)
-b = np.clip(b * 1.8, 0, 255)   # increase to cool down
+The debayer white balance is tuned in `camera-bridge.cpp` in `debayer_half()`.
+Adjust the integer multipliers:
+```cpp
+r = (r * 13) >> 3;  // ~1.625 — increase to warm up
+// g stays as-is (x1.0)
+b = (b * 10) >> 3;  // ~1.25  — increase to cool down
+```
+
+Rebuild and reinstall after changes:
+```bash
+./install.sh
+systemctl --user restart camera-bridge.service
 ```
 
 ---
 
-## File layout (installed)
+## Building manually
 
-| Path | Purpose |
-|------|---------|
-| `/usr/src/ipu-bridge-ov9734-1.0/` | Layer 1 DKMS source |
-| `/usr/src/ov9734-surface-1.0/` | Layer 3 DKMS source |
-| `/usr/local/sbin/ipu3-camera-rebind.sh` | Layer 2 rebind script |
-| `/etc/udev/rules.d/99-ov9734-rebind.rules` | udev rule (Layer 2) |
-| `/etc/modprobe.d/v4l2loopback.conf` | v4l2loopback parameters |
-| `/usr/local/share/surface-laptop-2-camera/camera-bridge.py` | Userspace bridge |
-| `~/.config/systemd/user/camera-bridge.service` | Systemd user service |
+```bash
+cd bridge
+make
+```
+
+Requires: `gstreamer1-devel`, `gstreamer1-plugins-base-devel`, `glib2-devel`,
+`pkg-config`, `g++`.
+
+---
+
+## File layout
+
+```
+bridge/
+  camera-bridge.cpp       C++ bridge source
+  Makefile                Build configuration
+  camera-bridge.service   Systemd user service unit
+gnome-extension/
+  camera-bridge@surface/
+    extension.js          GNOME Shell extension (toggle + brightness)
+    metadata.json         Extension metadata
+    stylesheet.css        Extension styles
+install.sh                Build and install everything
+uninstall.sh              Remove everything
+```
 
 ---
 
 ## Tested on
 
-| Distribution | Kernel | Status |
-|--------------|--------|--------|
-| POP!_OS 24.04 (Noble) | 6.18.7-surface-1 | ✅ Working |
-
-Contributions with test results on other distributions welcome.
+| Distribution | Kernel | Desktop | Status |
+|--------------|--------|---------|--------|
+| Fedora Silverblue 43 | 6.19.10-surface | GNOME 49 | Working |
 
 ---
 
 ## Acknowledgements
 
-Developed by reverse-engineering the ACPI DSDT tables (`CAMP`, `INT3472:01`),
-tracing `int3472-discrete` GPIO registration, and iterating through `dmesg` and
-`media-ctl` topology output to understand exactly why each layer failed.
+Forked from [tomgood19](https://github.com/tomgood18/surface-laptop-2-camera), this just rewrites the userspace handling for more efficient running. 

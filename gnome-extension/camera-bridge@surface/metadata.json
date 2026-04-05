@@ -1,0 +1,8 @@
+{
+    "uuid": "camera-bridge@surface",
+    "name": "Camera Bridge",
+    "description": "Toggle the Surface camera bridge service and adjust brightness",
+    "shell-version": ["49"],
+    "version": 1,
+    "url": ""
+}
